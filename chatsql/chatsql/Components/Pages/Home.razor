@@ -1,0 +1,117 @@
+﻿@page "/"
+@using Azure.AI.OpenAI
+@using MongoDB.Bson
+@using Newtonsoft.Json
+@using chatsql.Models
+@using chatsql.Services
+@rendermode InteractiveServer
+@inject MongoDBService mongoService
+@inject OpenAIClient openAIClient;
+
+<PageTitle>Home</PageTitle>
+
+<h1>Chat with the compendium! <button @onclick="uploadData" class="btn btn-secondary float-end">Upload data</button></h1>
+<p>Ask questions about monsters from Tears of the Kingdom.</p>
+@if (!string.IsNullOrEmpty(error))
+{
+    <div class="alert alert-danger"><p>Something went wrong: @error</p></div>
+}
+
+<div class="form-group mb-3">
+    <input class="form-control" @bind-value="query" placeholder="Ask your question!" />
+</div>
+<div class="form-group">
+    <button @onclick="Search" class="btn btn-primary">Submit</button>
+
+    
+</div>
+<br />
+@if (loading)
+{
+    <img style="width: 50px" src="loading.gif" />
+}
+<br />
+<p>@answer</p>
+
+@code {
+    private string query = String.Empty;
+    private string answer = String.Empty;
+    private string error = String.Empty;
+    private bool loading;
+    private readonly int maxResponseTokens = 1000;
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+    }
+
+    public async Task uploadData()
+    {
+        try
+        {
+            loading = true;
+            // Get sample data from file
+            var text = File.ReadAllText("monsters.json");
+            var monsters = JsonConvert.DeserializeObject<List<Monster>>(text);
+
+            // Create vector index in database
+            mongoService.CreateVectorIndexIfNotExists("vectorSearchIndex");
+
+            // Create db entry and embedding for each item
+            foreach (var monster in monsters)
+            {
+                await mongoService.CreateAsync(monster);
+            }
+            loading = false;
+        }
+        catch (Exception e)
+        {
+            error = e.Message;
+            loading = false;
+        }
+    }
+
+    public async Task Search()
+    {
+        try
+        {
+            loading = true;
+            // Get an embedding for the user query from OpenAI embedding model
+            List<string> serializedQuery = new() { JsonConvert.SerializeObject(query) };
+            EmbeddingsOptions options = new EmbeddingsOptions("wolfembedding", serializedQuery);
+
+            var response = await openAIClient.GetEmbeddingsAsync(options);
+            float[] embedding = response.Value.Data[0].Embedding.ToArray();
+
+            // Vector search mongodb for relevant db entries
+            var relevantMonsters = await mongoService.Search(embedding);
+
+            // Prepare a prompt with the data from the vector search
+            var systemMessage = new ChatRequestSystemMessage(@"Your are an intelligent, cheerful assistant
+                    designed to provide answers to user questions using only the following data:'
+
+                    ---"
+                    + JsonConvert.SerializeObject(relevantMonsters) +
+                    "--- If you do not know the answer, say 'I don't know'. Do not use any data besides what is in this prompt to generate a response.");
+            var userMessage = new ChatRequestUserMessage(query);
+
+            ChatCompletionsOptions chatOptions = new()
+                {
+                    Messages = { systemMessage, userMessage },
+                    MaxTokens = maxResponseTokens,
+                    DeploymentName = "test4"
+                };
+
+            // Send the vector search data to the chat model to get a refined answer
+            var completionsResponse = (await openAIClient.GetChatCompletionsAsync(chatOptions)).Value;
+            answer = completionsResponse.Choices[0].Message.Content;
+
+            loading = false;
+        }
+        catch (Exception e)
+        {
+            error = e.Message;
+            loading = false;
+        }
+    }
+}
